@@ -1,0 +1,200 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+      - "[0-9]*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux
+    runs-on: ubuntu-latest
+
+    env:
+      BUILD_DIR: build
+      BUILD_IMAGE: hun1er/oracle-7-cxx-build-env-gnu:latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Pull build image
+        shell: bash
+        run: |
+          set -eux
+          docker pull "${BUILD_IMAGE}"
+
+      - name: Build
+        shell: bash
+        run: |
+          set -eux
+
+          docker run --rm \
+            -e BUILD_DIR="${BUILD_DIR}" \
+            -v "${GITHUB_WORKSPACE}:/work" \
+            -w /work \
+            "${BUILD_IMAGE}" \
+            bash -lc '
+              set -eux
+
+              rm -rf "${BUILD_DIR}"
+
+              cmake -S . -B "${BUILD_DIR}" -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release
+
+              cmake --build "${BUILD_DIR}" --config Release --parallel
+
+              module="$(find "${BUILD_DIR}" -type f -name "amxxarch_amxx_i386.so" | head -n 1)"
+              test -n "${module}"
+
+              strip --strip-unneeded "${module}"
+            '
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          set -eux
+
+          module="$(find "${BUILD_DIR}" -type f -name "amxxarch_amxx_i386.so" | head -n 1)"
+          test -n "${module}"
+
+          mkdir -p artifact
+          cp "${module}" artifact/amxxarch_amxx_i386.so
+
+      - name: Upload linux binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux32
+          path: artifact/amxxarch_amxx_i386.so
+          if-no-files-found: error
+          compression-level: 9
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+
+    env:
+      BUILD_DIR: build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          cmake -S . -B "${env:BUILD_DIR}" `
+            -A Win32
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          cmake --build "${env:BUILD_DIR}" --config Release --parallel
+
+      - name: Prepare artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $module = Get-ChildItem "${env:BUILD_DIR}" -Recurse -File |
+            Where-Object { $_.Name -eq "amxxarch_amxx.dll" } |
+            Select-Object -First 1
+
+          if (-not $module) {
+            throw "amxxarch_amxx.dll was not found"
+          }
+
+          Get-Item $module.FullName | Select-Object FullName, Length
+
+          New-Item -ItemType Directory -Force -Path artifact | Out-Null
+          Copy-Item $module.FullName artifact/amxxarch_amxx.dll
+
+      - name: Upload windows binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: win32
+          path: artifact/amxxarch_amxx.dll
+          if-no-files-found: error
+          compression-level: 9
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs:
+      - linux
+      - windows
+    if: startsWith(github.ref, 'refs/tags/')
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download linux binary
+        uses: actions/download-artifact@v4
+        with:
+          name: linux32
+          path: artifacts/linux
+
+      - name: Download windows binary
+        uses: actions/download-artifact@v4
+        with:
+          name: win32
+          path: artifacts/windows
+
+      - name: Create release package
+        shell: bash
+        run: |
+          set -eux
+
+          test -f artifacts/linux/amxxarch_amxx_i386.so
+          test -f artifacts/windows/amxxarch_amxx.dll
+          test -f include/amxxarch.inc
+          test -f examples/amxxarch_example.sma
+
+          safe_tag="${GITHUB_REF_NAME//\//-}"
+          archive="amxxarch-${safe_tag}.zip"
+
+          rm -rf package
+          mkdir -p \
+            package/addons/amxmodx/modules \
+            package/addons/amxmodx/scripting \
+            package/addons/amxmodx/scripting/include \
+
+          cp artifacts/linux/amxxarch_amxx_i386.so package/addons/amxmodx/modules/amxxarch_amxx_i386.so
+          cp artifacts/windows/amxxarch_amxx.dll package/addons/amxmodx/modules/amxxarch_amxx.dll
+          cp examples/amxxarch_example.sma package/addons/amxmodx/scripting/amxxarch_example.sma
+          cp include/amxxarch.inc package/addons/amxmodx/scripting/include/amxxarch.inc
+
+          cd package
+          7z a -tzip -mx=9 "../${archive}" .
+
+      - name: Upload release package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-package
+          path: amxxarch-*.zip
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: amxxarch-*.zip
